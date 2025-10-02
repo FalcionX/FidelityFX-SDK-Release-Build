@@ -36,13 +36,13 @@ jobs:
           vcpkg integrate install
 
       - name: Fetch media if available
-        shell: powershell
+        shell: cmd
         run: |
-          if (Test-Path .\UpdateMedia.bat) {
-            cmd /c "call UpdateMedia.bat"
-          } else {
-            Write-Host "UpdateMedia.bat not found – skipping."
-          }
+          if exist UpdateMedia.bat (
+            call UpdateMedia.bat
+          ) else (
+            echo UpdateMedia.bat not found - skipping.
+          )
 
       - name: Locate .sln to build
         id: sln
