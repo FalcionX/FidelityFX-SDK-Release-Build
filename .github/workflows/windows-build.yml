@@ -1,0 +1,143 @@
+name: Build FidelityFX SDK (Windows) and commit to main/build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - 'build/**'
+  pull_request:
+    paths-ignore:
+      - 'build/**'
+
+env:
+  UPSTREAM_REPO: GPUOpen-LibrariesAndSDKs/FidelityFX-SDK
+  UPSTREAM_REF:  main
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
+          submodules: true
+          fetch-depth: 0
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Integrate vcpkg (fallback if needed)
+        shell: cmd
+        run: |
+          where vcpkg || ^
+          "%ProgramFiles(x86)%\Microsoft Visual Studio\2022\Enterprise\Common7\IDE\CommonExtensions\Microsoft\VCPkg\vcpkg.exe" integrate install || ^
+          vcpkg integrate install
+
+      - name: Fetch media if available
+        shell: powershell
+        run: |
+          if (Test-Path .\UpdateMedia.bat) {
+            cmd /c "call UpdateMedia.bat"
+          } else {
+            Write-Host "UpdateMedia.bat not found – skipping."
+          }
+
+      - name: Locate .sln to build
+        id: sln
+        shell: powershell
+        run: |
+          $all = Get-ChildItem -Recurse -Filter *.sln | Sort-Object FullName
+          if (-not $all) { Write-Error "No .sln files found."; exit 1 }
+          $pref = $all | Where-Object { $_.FullName -match '(?i)fsr' -and $_.FullName -match '(?i)dx12' } | Select-Object -First 1
+          $chosen = if ($pref) { $pref } else { $all | Select-Object -First 1 }
+          "sln_path=$($chosen.FullName)" >> $env:GITHUB_OUTPUT
+          "sln_dir=$($chosen.DirectoryName)" >> $env:GITHUB_OUTPUT
+          Write-Host "Chosen solution: $($chosen.FullName)"
+
+      - name: Build (Release x64)
+        shell: powershell
+        env:
+          SLN_PATH: ${{ steps.sln.outputs.sln_path }}
+          SLN_DIR:  ${{ steps.sln.outputs.sln_dir }}
+        run: |
+          Push-Location $env:SLN_DIR
+          msbuild "$env:SLN_PATH" /t:Build /p:Configuration=Release /p:Platform=x64 /m
+          Pop-Location
+
+      - name: Locate Release output dir
+        id: find_outdir
+        shell: powershell
+        run: |
+          $release = Get-ChildItem -Directory -Recurse -Filter 'Release' |
+            Where-Object { Get-ChildItem -Path $_.FullName -Recurse -Include *.exe -ErrorAction SilentlyContinue | Select-Object -First 1 } |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+          if (-not $release) { Write-Error "Release directory with .exe not found."; exit 1 }
+          "release_dir=$($release.FullName)" >> $env:GITHUB_OUTPUT
+          Write-Host "Release dir: $($release.FullName)"
+
+      - name: Collect artifacts
+        shell: powershell
+        env:
+          RELEASE_DIR: ${{ steps.find_outdir.outputs.release_dir }}
+        run: |
+          New-Item -ItemType Directory -Path artifacts -Force | Out-Null
+          Copy-Item -Recurse "$env:RELEASE_DIR\*" artifacts\
+          if (Test-Path media) { Copy-Item -Recurse media artifacts\media }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fidelityfx-sdk-win64
+          path: artifacts
+
+  publish:
+    name: Commit build output to your main/build/
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out your fork (this repo)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Ensure we are on main
+        shell: bash
+        run: |
+          set -e
+          git fetch origin
+          git checkout -B main origin/main
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: fidelityfx-sdk-win64
+          path: out
+
+      - name: Put artifacts into build/ folder
+        shell: bash
+        run: |
+          set -e
+          mkdir -p build
+          rm -rf build/*
+          shopt -s dotglob nullglob
+          cp -R out/* build/
+
+      - name: Commit and push if changed
+        shell: bash
+        env:
+          SHA_SHORT: ${{ github.sha }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A build
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Update build output from ${SHA_SHORT:0:7} [skip ci]"
+            git push origin main
+          fi
